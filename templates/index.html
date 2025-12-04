@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>Traceability Dashboard</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>Traceability Dashboard</h1>
+
+    <div id="auth">
+      <form id="login-form">
+        <label for="username">用户名</label>
+        <input type="text" id="username" placeholder="用户名" required />
+        <label for="password">密码</label>
+        <input type="password" id="password" placeholder="密码" required />
+        <button type="submit">登录</button>
+      </form>
+      <div id="user-info" style="display:none"></div>
+    </div>
+
+    <div id="dataset-tabs" class="tabs">
+      <button data-dataset="batchs" class="tab active">原材料批次记录</button>
+      <button data-dataset="mbpr" class="tab">原材料批次与工序关联</button>
+      <button data-dataset="empr" class="tab">设备维护与生产影响关联</button>
+    </div>
+
+    <div class="toolbar">
+      <label for="search" class="sr-only">搜索</label>
+      <input id="search" type="text" placeholder="搜索...（按当前表字段包含匹配）" />
+      <div class="pager">
+        <button id="prev-page">上一页</button>
+        <span id="page-info">第 1 页</span>
+        <button id="next-page">下一页</button>
+      </div>
+    </div>
+
+    <div id="error" class="error" style="display:none"></div>
+    <div id="loading" class="loading" style="display:none">加载中...</div>
+
+    <div id="admin-panel" style="display:none">
+      <h2 id="form-title">创建</h2>
+      <form id="create-form"></form>
+    </div>
+
+    <div class="table-wrap">
+      <table id="data-table">
+        <thead></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div id="empty" class="empty" style="display:none">暂无数据</div>
+  </div>
+
+  <script>
+    let token = null;
+    let role = 'guest';
+    let current = 'batchs';
+    let allRows = [];
+    let page = 1;
+    const pageSize = 10;
+
+    const endpoints = {
+      batchs: { list: '/raw-material-batches', create: '/raw-material-batches', del: (id) => `/raw-material-batches/${id}` },
+      mbpr: { list: '/material-batch-process-relations', create: '/material-batch-process-relations', del: (id) => `/material-batch-process-relations/${id}` },
+      empr: { list: '/equipment-maintenance-production-relations', create: '/equipment-maintenance-production-relations', del: (id) => `/equipment-maintenance-production-relations/${id}` },
+    };
+
+    const tableSchemas = {
+      batchs: {
+        headers: ['BatchID','MaterialID','SupplierID','POID','BatchQuantity','StorageTime','QualityCheckResult','InspectionReportID','StorageLocation','ExpirationDate','UsedQuantity','RemainingQuantity','BatchStatus','Actions'],
+        row: (r) => [r.batchid, r.materialid, r.supplierid, r.purchaseorderid, r.batchquantity, new Date(r.storagetime).toLocaleString(), r.qualitycheckresult || '', r.inspectionreportid || '', r.storagelocation, r.expirationdate, r.usedquantity, r.remainingquantity, r.batchstatus || '', actionButtons(r.batchid)],
+        idField: 'batchid',
+      },
+      mbpr: {
+        headers: ['RelationID','BatchID','ProcessID','UsedQuantity','UseTime','OperatorID','RecordStatus','Actions'],
+        row: (b) => [b.relationid, b.batchid, b.processid, b.usedquantity, new Date(b.usetime).toLocaleString(), b.operatorid, b.recordstatus, actionButtons(b.relationid)],
+        idField: 'relationid',
+      },
+      empr: {
+        headers: ['RelationID','MaintenanceID','ProductionPlanID','ImpactHours','ImpactProcess','Countermeasure','RecoveryTime','Actions'],
+        row: (w) => [w.relationid, w.maintenanceid, w.productionplanid, w.impacthours, w.impactprocess || '', w.countermeasure || '', w.recoverytime ? new Date(w.recoverytime).toLocaleString() : '', actionButtons(w.relationid)],
+        idField: 'relationid',
+      },
+    };
+
+    function setLoading(on) {
+      document.getElementById('loading').style.display = on ? 'block' : 'none';
+    }
+    function showError(msg) {
+      const el = document.getElementById('error');
+      el.textContent = msg || '';
+      el.style.display = msg ? 'block' : 'none';
+    }
+    function toggleEmpty(show) {
+      document.getElementById('empty').style.display = show ? 'block' : 'none';
+    }
+
+    function actionButtons(id) {
+      return role === 'admin' ? `<button class="delete-btn" data-id="${id}">删除</button>` : '';
+    }
+
+    function renderTableHeader(headers) {
+      const thead = document.querySelector('#data-table thead');
+      thead.innerHTML = `<tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr>`;
+    }
+
+    function renderPage() {
+      const tbody = document.querySelector('#data-table tbody');
+      const search = document.getElementById('search').value.trim().toLowerCase();
+      const filtered = !search ? allRows : allRows.filter(r => JSON.stringify(r).toLowerCase().includes(search));
+      const total = filtered.length;
+      const maxPage = Math.max(1, Math.ceil(total / pageSize));
+      page = Math.min(page, maxPage);
+      document.getElementById('page-info').textContent = `第 ${page} 页 / 共 ${maxPage} 页（${total} 条）`;
+      tbody.innerHTML = '';
+      toggleEmpty(total === 0);
+      const start = (page - 1) * pageSize;
+      const slice = filtered.slice(start, start + pageSize);
+      for (const row of slice) {
+        const tr = document.createElement('tr');
+        const cells = tableSchemas[current].row(row);
+        tr.innerHTML = cells.map(c => `<td title="${String(c).replace(/"/g,'&quot;')}">${c}</td>`).join('');
+        tbody.appendChild(tr);
+      }
+    }
+
+    async function fetchList() {
+      setLoading(true);
+      showError('');
+      toggleEmpty(false);
+      try {
+        const res = await fetch(endpoints[current].list);
+        if (!res.ok) {
+          showError(`加载失败: ${res.status}`);
+          allRows = [];
+          renderPage();
+          return;
+        }
+        allRows = await res.json();
+        page = 1;
+        renderPage();
+      } catch (e) {
+        showError(e.message || '加载失败');
+        allRows = [];
+        renderPage();
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    function renderForm() {
+      const panel = document.getElementById('admin-panel');
+      panel.style.display = role === 'admin' ? 'block' : 'none';
+      const form = document.getElementById('create-form');
+      if (current === 'batchs') {
+        form.innerHTML = `
+          <input name=\"batchid\" placeholder=\"BatchID\" required />
+          <input name=\"materialid\" placeholder=\"MaterialID\" required />
+          <input name=\"supplierid\" placeholder=\"SupplierID\" required />
+          <input name=\"purchaseorderid\" placeholder=\"POID\" required />
+          <input name=\"batchquantity\" type=\"number\" step=\"0.01\" placeholder=\"BatchQuantity\" required />
+          <input name=\"storagelocation\" placeholder=\"StorageLocation\" required />
+          <input name=\"expirationdate\" type=\"date\" placeholder=\"ExpirationDate\" required />
+          <input name=\"usedquantity\" type=\"number\" step=\"0.01\" placeholder=\"UsedQuantity\" value=\"0\" required />
+          <select name=\"qualitycheckresult\">
+            <option></option>
+            <option>合格</option>
+            <option>不合格</option>
+            <option>待检测</option>
+          </select>
+          <input name=\"inspectionreportid\" placeholder=\"InspectionReportID\" />
+          <select name=\"batchstatus\">
+            <option></option>
+            <option>在库</option>
+            <option>已用完</option>
+            <option>已冻结</option>
+          </select>
+          <button type=\"submit\">创建</button>`;
+      } else if (current === 'mbpr') {
+        form.innerHTML = `
+          <input name=\"relationid\" placeholder=\"RelationID\" required />
+          <input name=\"batchid\" placeholder=\"BatchID\" required />
+          <input name=\"processid\" placeholder=\"ProcessID\" required />
+          <input name=\"usedquantity\" type=\"number\" step=\"0.01\" placeholder=\"UsedQuantity\" required />
+          <input name=\"operatorid\" placeholder=\"OperatorID\" required />
+          <select name=\"recordstatus\">
+            <option>正常</option>
+            <option>异常</option>
+          </select>
+          <button type=\"submit\">创建</button>`;
+      } else if (current === 'empr') {
+        form.innerHTML = `
+          <input name=\"relationid\" placeholder=\"RelationID\" required />
+          <input name=\"maintenanceid\" placeholder=\"MaintenanceID\" required />
+          <input name=\"productionplanid\" placeholder=\"ProductionPlanID\" required />
+          <input name=\"impacthours\" type=\"number\" step=\"0.1\" placeholder=\"ImpactHours\" value=\"0\" required />
+          <input name=\"impactprocess\" placeholder=\"ImpactProcess\" />
+          <input name=\"countermeasure\" placeholder=\"Countermeasure\" />
+          <input name=\"recoverytime\" type=\"datetime-local\" placeholder=\"RecoveryTime\" />
+          <button type=\"submit\">创建</button>`;
+      }
+    }
+
+    async function switchDataset(ds) {
+      current = ds;
+      document.querySelectorAll('#dataset-tabs .tab').forEach(btn => btn.classList.toggle('active', btn.getAttribute('data-dataset') === ds));
+      renderTableHeader(tableSchemas[current].headers);
+      renderForm();
+      await fetchList();
+    }
+
+    document.getElementById('dataset-tabs').addEventListener('click', (e) => {
+      const btn = e.target.closest('.tab');
+      if (!btn) return;
+      const ds = btn.getAttribute('data-dataset');
+      switchDataset(ds);
+    });
+
+    document.getElementById('search').addEventListener('input', () => {
+      page = 1;
+      renderPage();
+    });
+    document.getElementById('prev-page').addEventListener('click', () => {
+      page = Math.max(1, page - 1);
+      renderPage();
+    });
+    document.getElementById('next-page').addEventListener('click', () => {
+      const total = allRows.length;
+      const maxPage = Math.max(1, Math.ceil(total / pageSize));
+      page = Math.min(maxPage, page + 1);
+      renderPage();
+    });
+
+    document.getElementById('create-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (role !== 'admin' || !token) return alert('需要管理员登录');
+      const fd = new FormData(e.target);
+      let body;
+      if (current === 'batchs') {
+        body = {
+          batchid: fd.get('batchid').trim(),
+          materialid: fd.get('materialid').trim(),
+          supplierid: fd.get('supplierid').trim(),
+          purchaseorderid: fd.get('purchaseorderid').trim(),
+          batchquantity: parseFloat(fd.get('batchquantity')),
+          storagelocation: fd.get('storagelocation').trim(),
+          expirationdate: fd.get('expirationdate'),
+          usedquantity: parseFloat(fd.get('usedquantity')),
+          qualitycheckresult: fd.get('qualitycheckresult') || null,
+          inspectionreportid: (fd.get('inspectionreportid')||'').trim() || null,
+          batchstatus: fd.get('batchstatus') || null,
+        };
+      } else if (current === 'mbpr') {
+        body = {
+          relationid: fd.get('relationid').trim(),
+          batchid: fd.get('batchid').trim(),
+          processid: fd.get('processid').trim(),
+          usedquantity: parseFloat(fd.get('usedquantity')),
+          operatorid: fd.get('operatorid').trim(),
+          recordstatus: fd.get('recordstatus'),
+        };
+      } else if (current === 'empr') {
+        body = {
+          relationid: fd.get('relationid').trim(),
+          maintenanceid: fd.get('maintenanceid').trim(),
+          productionplanid: fd.get('productionplanid').trim(),
+          impacthours: parseFloat(fd.get('impacthours')),
+          impactprocess: (fd.get('impactprocess')||'').trim() || null,
+          countermeasure: (fd.get('countermeasure')||'').trim() || null,
+          recoverytime: (fd.get('recoverytime')||'').trim() ? new Date(fd.get('recoverytime')).toISOString() : null,
+        };
+      }
+      const res = await fetch(endpoints[current].create, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify(body)
+      });
+      if (!res.ok) {
+        try {
+          const data = await res.json();
+          alert(data.detail || '操作失败');
+        } catch { alert('操作失败'); }
+      }
+      e.target.reset();
+      await fetchList();
+    });
+
+    document.querySelector('#data-table').addEventListener('click', async (e) => {
+      const btn = e.target.closest('.delete-btn');
+      if (!btn) return;
+      if (role !== 'admin' || !token) return alert('需要管理员登录');
+      const id = btn.getAttribute('data-id');
+      const res = await fetch(endpoints[current].del(id), { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
+      if (!res.ok && res.status !== 204) {
+        try {
+          const data = await res.json();
+          alert(data.detail || '删除失败');
+        } catch { alert('删除失败'); }
+      }
+      await fetchList();
+    });
+
+    async function refreshUser() {
+      if (!token) {
+        role = 'guest';
+        document.getElementById('admin-panel').style.display = 'none';
+        document.getElementById('user-info').style.display = 'none';
+        return;
+      }
+      const res = await fetch('/me', { headers: { Authorization: `Bearer ${token}` } });
+      if (!res.ok) {
+        role = 'guest';
+        token = null;
+        document.getElementById('admin-panel').style.display = 'none';
+        document.getElementById('user-info').style.display = 'none';
+        return;
+      }
+      const me = await res.json();
+      role = me.role;
+      const info = document.getElementById('user-info');
+      info.textContent = `已登录: ${me.username} (${me.role})`;
+      info.style.display = 'block';
+      document.getElementById('admin-panel').style.display = role === 'admin' ? 'block' : 'none';
+    }
+
+    document.getElementById('login-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const username = document.getElementById('username').value.trim();
+      const password = document.getElementById('password').value;
+      const body = new URLSearchParams();
+      body.append('username', username);
+      body.append('password', password);
+      body.append('grant_type', 'password');
+      const res = await fetch('/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+      if (!res.ok) {
+        const data = await res.json();
+        alert(data.detail || '登录失败');
+        return;
+      }
+      const data = await res.json();
+      token = data.access_token;
+      await refreshUser();
+      await switchDataset(current);
+    });
+
+    // Initial render
+    refreshUser();
+    switchDataset('batchs');
+  </script>
+</body>
+</html>
